@@ -1,0 +1,166 @@
+#!/usr/bin/env sh
+
+RESTORE="\033[0m"
+GREEN="\033[0;32m"
+RED="\033[0;31m"
+YELLOW="\033[0;33m"
+
+xremove_list=''
+server_args=''
+
+log() { printf " ${2:-$GREEN}*$RESTORE %s" "$1" >&2; }
+
+error() {
+    {
+        echo 'error'
+        log "ERROR: $1" "$RED"
+        echo
+    } >&2
+    exit 1
+}
+
+warning() {
+    {
+        echo 'warning'
+        log "WARNING: $1" "$YELLOW"
+        echo
+        log '... ' "$RESTORE"
+    } >&2
+}
+
+set_env() {
+    unset DBUS_SESSION_BUS_ADDRESS
+    unset SESSION_MANAGER
+
+    export STX_FILES="$HOME/.local/share/xorg/stx"
+
+    if [ ! -d "$STX_FILES" ]; then
+        warning "$STX_FILES does not exist... creating it"
+        mkdir -p "$STX_FILES"
+    fi
+
+    export XAUTHORITY="$STX_FILES/Xauthority"
+}
+
+find_new_xdisplay() {
+    display=0
+    while true; do
+        [ -e "/tmp/.X$display-lock" ] || [ -S "/tmp/.X11-unix/X$display" ] || break
+        display=$((display + 1))
+    done
+
+    echo "$display"
+}
+
+gen_xauth() {
+    cookie="$(mcookie)"
+
+    [ ! "$cookie" ] && error 'Failed to create a cookie using mcookie'
+
+    # Set up auth file
+
+    dummy=0
+    xauth_file="$(mktemp --tmpdir stx_xauth.XXXXXXXXXX)"
+
+    # shellcheck disable=SC2064
+    trap "rm -f '$xauth_file'" HUP INT QUIT ILL TRAP BUS TERM
+
+    xauth -q -f "$xauth_file" <<EOF
+add :$dummy . $cookie
+EOF
+
+    # Auth file
+
+    server_args="${server_args} -auth ${xauth_file}"
+
+    # Setup
+
+    for display_name in ":$1" "$(hostname -f):$1"; do
+        auth_cookie="$(xauth list "$display_name" |
+            sed -n "s/.*${display_name}[[:space:]*].*[[:space:]*]//p")"
+
+        if [ ! "${auth_cookie}" ]; then
+            xauth -q <<EOF
+add $display_name . $cookie
+EOF
+            xremove_list="$display_name $xremove_list"
+
+        else
+            dummy=$((dummy + 1))
+            xauth -q -f "$xauth_file" <<EOF
+add :$dummy . $auth_cookie
+EOF
+        fi
+    done
+
+    echo "$xauth_file"
+}
+
+start_x() {
+    # shellcheck disable=SC2086
+    xinit "${XC:-$HOME/.config/stx_init.sh}" -- "${X:-/etc/X11/xinit/xserverrc}" "$xdisplay" $server_args
+    ret_code="$?"
+
+    [ "$ret_code" != 0 ] && error "xinit exited with code $ret_code"
+    echo "$ret_code"
+}
+
+xauth_cleanup() {
+    [ "$1" ] && xauth remove "$1"
+    [ -f "$2" ] && rm -f "$2"
+    command -v deallocvt >/dev/null && deallocvt
+
+    return 0
+}
+
+main() {
+    set -e
+
+    # Environment
+
+    log 'Setting up environment... '
+
+    set_env
+
+    echo 'done'
+
+    # Display
+
+    log 'Finding new XDisplay... '
+
+    display="$(find_new_xdisplay)"
+    [ ! "$display" ] && echo 'failed' && exit 1
+    xdisplay=":$display"
+
+    echo "found $xdisplay"
+
+    # XAuth
+
+    log 'Setting up xauth... '
+
+    xauth_file="$(gen_xauth "$display")"
+
+    echo 'done'
+
+    # Init
+
+    log 'Starting X server'
+
+    ret_code="$(start_x)"
+
+    # Clean up xauth
+
+    log 'Cleaning up xauth... '
+
+    xauth_cleanup "$xremove_list" "$xauth_file"
+
+    echo 'done'
+
+    # Exit
+
+    log "Exiting with code $ret_code"
+    echo
+    exit "$ret_code"
+}
+
+[ "$STX_LIB" ] || main "$@"
